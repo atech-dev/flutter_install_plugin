@@ -1,3 +1,8 @@
+## 3.0.0
+
+* refactor: updated Android app installation implementation
+* chore: Migrate to Java 21.0.5
+
 ## 2.1.0
 
 * Support low version Android installation (tested 5, 6, 7, 8, 9, 10, 11, 12, 13, the version lower than 5 has not been tested, if there is any problem, please report to me)
