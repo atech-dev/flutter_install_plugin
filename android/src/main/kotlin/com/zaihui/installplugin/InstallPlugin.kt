@@ -1,8 +1,10 @@
 package com.zaihui.installplugin
 
 import android.app.Activity
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -24,6 +26,9 @@ class InstallPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAw
     private var context: Context? = null
     private val activity get() = activityReference.get()
     private var activityReference = WeakReference<Activity>(null)
+    private var installReceiver: BroadcastReceiver? = null
+    private var targetPackage: String? = null
+    private var isInstalling = false
 
     private val REQUEST_CODE_PERMISSION_OR_INSTALL = 1024
 
@@ -42,7 +47,6 @@ class InstallPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAw
         mResult = null
     }
 
-    // ActivityAware
     override fun onAttachedToActivity(binding: ActivityPluginBinding) {
         activityReference = WeakReference(binding.activity)
         binding.addActivityResultListener { requestCode, resultCode, data ->
@@ -50,7 +54,86 @@ class InstallPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAw
         }
     }
 
+    private fun registerInstallReceiver(packageName: String, version: String) {
+        Log.i("InstallPlugin", "Registering install receiver for $packageName version $version")
+        Log.i("InstallPlugin", "Current isInstalling flag: $isInstalling")
+        unregisterInstallReceiver() // Clear previous receiver if exists
+        
+        targetPackage = packageName // Save target package
+        
+        installReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                val action = intent?.action
+                val receivedPackage = intent?.data?.schemeSpecificPart
+                
+                Log.i("InstallPlugin", "Broadcast received:")
+                Log.i("InstallPlugin", "Action: $action")
+                Log.i("InstallPlugin", "Package: $receivedPackage")
+                Log.i("InstallPlugin", "Target Package: $targetPackage")
+                Log.i("InstallPlugin", "isInstalling: $isInstalling")
+                
+                if (!isInstalling) {
+                    Log.i("InstallPlugin", "Skipping broadcast - not installing")
+                    return
+                }
+                
+                if (receivedPackage == targetPackage && receivedPackage != null) {
+                    try {
+                        val pm = context?.packageManager
+                        val info = pm?.getPackageInfo(receivedPackage, 0)
+                        Log.i("InstallPlugin", "Installed version: ${info?.versionName}, Expected: $version")
+                        
+                        if (info?.versionName == version) {
+                            Log.i("InstallPlugin", "Installation confirmed successful")
+                            isInstalling = false
+                            mResult?.success(SaveResultModel(true, "Install Success").toHashMap())
+                        } else {
+                            Log.w("InstallPlugin", "Version mismatch after install")
+                            isInstalling = false
+                            mResult?.success(SaveResultModel(false, "Version mismatch").toHashMap())
+                        }
+                    } catch (e: Exception) {
+                        Log.e("InstallPlugin", "Error verifying installation: ${e.message}")
+                        isInstalling = false
+                        mResult?.success(SaveResultModel(false, "Install verification failed").toHashMap())
+                    } finally {
+                        unregisterInstallReceiver()
+                    }
+                }
+            }
+        }
+
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_PACKAGE_ADDED)
+            addAction(Intent.ACTION_PACKAGE_REPLACED)
+            addAction(Intent.ACTION_PACKAGE_CHANGED)
+            addAction(Intent.ACTION_PACKAGE_INSTALL)
+            addDataScheme("package")
+        }
+        
+        Log.i("InstallPlugin", "Registering receiver with actions: ${filter.actionsIterator().asSequence().toList()}")
+        
+        try {
+            activity?.applicationContext?.registerReceiver(installReceiver, filter)
+            Log.i("InstallPlugin", "Receiver registered successfully")
+        } catch (e: Exception) {
+            Log.e("InstallPlugin", "Error registering receiver: ${e.message}")
+        }
+    }
+
+    private fun unregisterInstallReceiver() {
+        installReceiver?.let { receiver ->
+            try {
+                activity?.unregisterReceiver(receiver)
+            } catch (e: Exception) {
+                Log.e("InstallPlugin", "Error unregistering receiver: ${e.message}")
+            }
+        }
+        installReceiver = null
+    }
+
     override fun onDetachedFromActivityForConfigChanges() {
+        unregisterInstallReceiver()
         activityReference.clear()
     }
 
@@ -62,6 +145,7 @@ class InstallPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAw
     }
 
     override fun onDetachedFromActivity() {
+        unregisterInstallReceiver()
         activityReference.clear()
     }
 
@@ -78,109 +162,108 @@ class InstallPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAw
         }
     }
 
-    private fun installApk(filePath: String?,packageName:String?) {
+    private fun installApk(filePath: String?, packageName: String?) {
+        Log.i("InstallPlugin", "Starting APK installation process")
+        
         if (filePath.isNullOrEmpty()) {
+            Log.e("InstallPlugin", "File path is null or empty")
             mResult?.success(SaveResultModel(false, "FilePath Must Not Null").toHashMap())
             return
         }
+        
         apkFilePath = filePath
-        val pName = if (packageName.isNullOrEmpty()) {
-            context?.packageName
-        } else {
-            packageName
-        }
-        if (pName.isNullOrEmpty()) {
-            mResult?.success(
-                SaveResultModel(
-                    false,
-                    "Failed To Obtain PackageName Must Not Null"
-                ).toHashMap()
-            )
+        val file = File(filePath)
+        
+        if (!file.exists()) {
+            Log.e("InstallPlugin", "APK file does not exist")
+            mResult?.success(SaveResultModel(false, "APK file not found").toHashMap())
             return
         }
-        if (hasInstallPermission()) {
-            hasPermission = true
-            // begin install
-            val intent = getInstallAppIntent(context, pName, filePath, false)
-            if (intent == null) {
-                mResult?.success(SaveResultModel(false, "Not Get Install Intent").toHashMap())
-                return
-            }
-            intent.addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
-            intent.putExtra(Intent.EXTRA_RETURN_RESULT, true)
-            activity?.startActivityForResult(intent, REQUEST_CODE_PERMISSION_OR_INSTALL)
-        } else {
-            hasPermission = false
-            // request install permission
-            requestInstallPermission(pName)
+        
+        if (!file.canRead()) {
+            Log.e("InstallPlugin", "Cannot read APK file")
+            mResult?.success(SaveResultModel(false, "Cannot read APK file").toHashMap())
+            return
         }
-    }
+        
+        val currentContext = context
+        if (currentContext == null) {
+            Log.e("InstallPlugin", "Context is null")
+            mResult?.success(SaveResultModel(false, "Context is null").toHashMap())
+            return
+        }
+        
+        try {
+            if (hasInstallPermission()) {
+                Log.i("InstallPlugin", "Has install permission")
+                hasPermission = true
+                isInstalling = true  // Set installation flag
 
-    private fun getInstallAppIntent(context: Context?,packageName:String, filePath: String?, newTask: Boolean): Intent? {
-        if (context == null) return null
-        if (filePath.isNullOrEmpty()) return null
-        var file = File(filePath)
-        if (!file.exists()) return null
-        Log.i("test","getInstallAppIntent:${Build.VERSION.SDK_INT}")
-        if(Build.VERSION.SDK_INT<=Build.VERSION_CODES.M){
-            val storePath =
-                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).absolutePath
-            // DIRECTORY_DOWNLOADS
-            val downloadsDir = File(storePath).apply {
-                if (!exists()) {
-                    mkdir()
-                }
-            }
-            // DIRECTORY_DOWNLOADS / packageName
-            val downloadsAppDir = File(downloadsDir,packageName).apply {
-                if (!exists()) {
-                    mkdir()
-                }
-            }
-            Log.i("test","getInstallAppIntent:$storePath")
-            val destFile = File(downloadsAppDir, file.name)
-            file.copyTo(destFile, overwrite = true)
-            file = destFile
-        }
+                // Get APK info
+                val packageInfo = context?.packageManager?.getPackageArchiveInfo(filePath, 0)
+                val apkPackageName = packageInfo?.packageName
+                val version = packageInfo?.versionName
+                
+                if (apkPackageName != null && version != null) {
+                    // Register receiver before starting installation
+                    registerInstallReceiver(apkPackageName, version)
+                    
+                    val uri = InstallFileProvider.getUriForFile(currentContext, file)
+                    val intent = Intent(Intent.ACTION_VIEW).apply {
+                        setDataAndType(uri, "application/vnd.android.package-archive")
+                        flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK
+                        putExtra(Intent.EXTRA_NOT_UNKNOWN_SOURCE, true)
+                        putExtra(Intent.EXTRA_RETURN_RESULT, true)
+                    }
 
-        val uri: Uri = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
-            Uri.fromFile(file)
-        } else {
-            InstallFileProvider.getUriForFile(context, file)
+                    Log.i("InstallPlugin", "Launching install intent:")
+                    Log.i("InstallPlugin", "URI: $uri")
+                    Log.i("InstallPlugin", "Package: ${currentContext.packageName}")
+                    Log.i("InstallPlugin", "File exists: ${File(filePath).exists()}")
+
+                    if (activity != null) {
+                        activity?.startActivity(intent)  // Use startActivity instead of startActivityForResult
+                        Log.i("InstallPlugin", "Installation intent launched")
+                    } else {
+                        isInstalling = false
+                        Log.e("InstallPlugin", "Activity is null")
+                        mResult?.success(SaveResultModel(false, "Activity is null").toHashMap())
+                    }
+                } else {
+                    isInstalling = false
+                    Log.e("InstallPlugin", "Invalid APK info")
+                    mResult?.success(SaveResultModel(false, "Invalid APK info").toHashMap())
+                }
+            } else {
+                Log.i("InstallPlugin", "Requesting install permission")
+                hasPermission = false
+                requestInstallPermission(packageName ?: currentContext.packageName)
+            }
+        } catch (e: Exception) {
+            isInstalling = false
+            Log.e("InstallPlugin", "Installation error: ${e.message}")
+            mResult?.success(SaveResultModel(false, "Installation error: ${e.message}").toHashMap())
         }
-        Log.i("test","getInstallAppIntent:$uri")
-        val intent = Intent(Intent.ACTION_VIEW)
-        val type = "application/vnd.android.package-archive"
-        intent.setDataAndType(uri, type)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            intent.flags = Intent.FLAG_GRANT_READ_URI_PERMISSION
-        }
-        return if (!newTask) {
-            intent
-        } else intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     }
 
     private fun handleActivityResult(requestCode: Int, resultCode: Int, data: Intent?): Boolean {
         Log.i("InstallPlugin", "handleActivityResult($requestCode,$resultCode,$data)")
+        
         if (requestCode == REQUEST_CODE_PERMISSION_OR_INSTALL) {
-            if (resultCode == Activity.RESULT_OK) {
-                if (hasPermission) {
-                    mResult?.success(SaveResultModel(true, "Install Success").toHashMap())
-                } else {
-                    installApk(apkFilePath,"")
-                }
-            } else {
-                if (hasPermission) {
-                    mResult?.success(SaveResultModel(false, "Install Cancel").toHashMap())
-                } else {
-                    mResult?.success(
-                        SaveResultModel(
-                            false,
-                            "Request Install Permission Fail"
-                        ).toHashMap()
-                    )
+            if (!hasPermission) {
+                // Handle only permission result
+                when (resultCode) {
+                    Activity.RESULT_OK -> {
+                        Log.i("InstallPlugin", "Permission granted, starting installation")
+                        installApk(apkFilePath, "")
+                    }
+                    else -> {
+                        Log.e("InstallPlugin", "Permission denied")
+                        mResult?.success(SaveResultModel(false, "Permission denied").toHashMap())
+                    }
                 }
             }
+            // Ignore activity result during installation, wait for BroadcastReceiver
             return true
         }
         return false
@@ -195,7 +278,6 @@ class InstallPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAw
     }
 
     private fun requestInstallPermission(packageName: String) {
-        // request install permission
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val intent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES)
             intent.data = Uri.parse("package:$packageName")
